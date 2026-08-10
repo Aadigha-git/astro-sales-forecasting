@@ -10,10 +10,14 @@ from datetime import datetime, timedelta
 import os
 import sys
 
-# Add paths
+# Add paths (UI + include for shared modules)
 sys.path.append(os.path.dirname(os.path.abspath(__file__)))
+from utils.path_setup import ensure_include_on_path
+ensure_include_on_path()
+
 from utils.simple_model_loader import SimpleModelLoader
 from utils.simple_predictor import SimplePredictor
+from utils.ui_common import init_session, render_model_loader_sidebar
 import logging
 
 logging.basicConfig(level=logging.INFO)
@@ -26,48 +30,20 @@ st.set_page_config(
     layout="wide"
 )
 
-# Initialize session state
-if 'model_loader' not in st.session_state:
-    st.session_state.model_loader = SimpleModelLoader()
-    st.session_state.predictor = SimplePredictor(st.session_state.model_loader)
-    st.session_state.models_loaded = False
-    st.session_state.run_id = None
+init_session()
 
 # Header
 st.title("🔮 Sales Forecast Inference")
-st.markdown("Generate sales predictions using trained ML models")
+st.markdown(
+    "Generate sales predictions using trained ML models. "
+    "Use the sidebar pages for **Staffing Plan** and **Model Comparison**."
+)
 
-# Sidebar for model loading
+# Sidebar for model loading (shared helper)
+render_model_loader_sidebar()
+
 with st.sidebar:
-    st.header("📦 Model Configuration")
-    
-    if not st.session_state.models_loaded:
-        st.warning("⚠️ No models loaded")
-    else:
-        st.success("✅ Models loaded")
-        st.info(f"Models: {', '.join(st.session_state.model_loader.models.keys())}")
-        if st.session_state.run_id:
-            st.caption(f"Run ID: {st.session_state.run_id[:8]}...")
-    
-    if st.button("🔄 Load/Reload Models", type="primary", use_container_width=True):
-        with st.spinner("Loading models..."):
-            # Get latest run or use specific run
-            run_id = st.session_state.model_loader.get_latest_run()
-            if not run_id:
-                # Use known good run ID as fallback
-                run_id = "f4b632f644f742ceab8397bccac14da8"
-                st.info(f"Using fallback run ID: {run_id[:8]}...")
-            
-            if run_id and st.session_state.model_loader.load_models_from_run(run_id):
-                st.session_state.models_loaded = True
-                st.session_state.run_id = run_id
-                st.success("✅ Models loaded!")
-                st.rerun()
-            else:
-                st.error("❌ Failed to load models")
-    
     st.markdown("---")
-    
     # Model selection
     model_type = st.selectbox(
         "Model Type",
@@ -330,7 +306,7 @@ else:
         
         If this is your first time using the system, you need to train the models:
         
-        1. **Open Airflow UI**: [http://localhost:8080](http://localhost:8080)
+        1. **Open Airflow UI** (Astro prints the URL, often `http://astro-salesforecast.localhost:6563` or `http://localhost:8080`)
            - Username: `admin`
            - Password: `admin`
         
@@ -341,7 +317,7 @@ else:
         
         3. **Come back here**:
            - Click "Load/Reload Models" again
-           - Models should load successfully
+           - Open **Staffing Plan** / **Model Comparison** from the sidebar pages
         
         ### Quick Check
         
@@ -349,4 +325,5 @@ else:
         - **MinIO UI**: [http://localhost:9001](http://localhost:9001) - Check artifact storage
           - Username: `minioadmin`
           - Password: `minioadmin`
+        - **Streamlit**: [http://localhost:8501](http://localhost:8501)
         """)

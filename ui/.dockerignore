@@ -1,0 +1,8 @@
+# Keep Streamlit image builds fast and cache-friendly.
+# App code is volume-mounted at runtime — no need to bake every .py into the image.
+__pycache__
+*.pyc
+.pytest_cache
+.DS_Store
+pages/__pycache__
+utils/__pycache__

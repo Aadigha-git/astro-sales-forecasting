@@ -191,21 +191,94 @@ def sales_forecast_training():
             train_df, val_df, test_df, target_col="sales", use_optuna=True
         )
         for model_name, model_results in results.items():
-            if "metrics" in model_results:
-                print(f"\n{model_name} metrics:")
+            if model_name == "rolling_origin_cv":
+                continue
+            if model_name in ("multi_horizon_evaluation", "forecast_quality"):
+                continue
+            if isinstance(model_results, dict) and "metrics" in model_results:
+                print(f"\n{model_name} holdout metrics:")
                 for metric, value in model_results["metrics"].items():
                     print(f"  {metric}: {value:.4f}")
+                if model_results.get("cv_metrics"):
+                    print(f"{model_name} rolling-origin CV (aggregated):")
+                    for metric, value in model_results["cv_metrics"].items():
+                        print(f"  {metric}: {value:.4f}")
+        if isinstance(results.get("rolling_origin_cv"), dict):
+            cv_cfg = results["rolling_origin_cv"].get("config", {})
+            print(
+                f"\nRolling-origin CV summary: "
+                f"folds={cv_cfg.get('n_folds')}, horizon={cv_cfg.get('horizon')}, "
+                f"samples={cv_cfg.get('n_samples')}"
+            )
+        if isinstance(results.get("multi_horizon_evaluation"), dict):
+            mh = results["multi_horizon_evaluation"]
+            print(
+                f"\nMulti-horizon evaluation: "
+                f"horizons={mh.get('config', {}).get('horizons')}, "
+                f"folds={mh.get('config', {}).get('n_folds')}"
+            )
+            for row in mh.get("accuracy_by_horizon", []):
+                print(
+                    f"  {row['model']} h={row['horizon']}d: "
+                    f"RMSE={row.get('rmse', float('nan')):.4f}, "
+                    f"MAE={row.get('mae', float('nan')):.4f}, "
+                    f"WAPE={row.get('wape', float('nan')):.4f}, "
+                    f"bias={row.get('bias', float('nan')):.4f}"
+                )
+        if isinstance(results.get("forecast_quality"), dict):
+            fq = results["forecast_quality"]
+            print(f"\nForecast quality overall: {fq.get('summary')}")
+            for model_name, rep in (fq.get("models") or {}).items():
+                print(
+                    f"  [{rep.get('summary')}] {model_name}: "
+                    f"pass={rep.get('n_pass')}, warn={rep.get('n_warning')}, "
+                    f"fail={rep.get('n_fail')}"
+                )
+                for check in rep.get("checks") or []:
+                    if check.get("status") != "PASS":
+                        print(f"    - {check['status']}: {check['name']} — {check['message']}")
         print("\nVisualization charts have been generated and saved to MLflow/MinIO")
         print("Charts include:")
-        print("  - Model metrics comparison")
+        print("  - Model metrics comparison (MAE / RMSE / WAPE / Bias)")
+        print("  - Model comparison table (MAE / RMSE / WAPE / Bias)")
         print("  - Predictions vs actual values")
         print("  - Residuals analysis")
         print("  - Error distribution")
         print("  - Feature importance comparison")
+        print("  - Rolling-origin cross-validation")
+        print("  - Forecast accuracy by horizon (1/3/7/14 day)")
         serializable_results = {}
         for model_name, model_results in results.items():
+            if model_name == "rolling_origin_cv":
+                cv_payload = model_results
+                serializable_results["rolling_origin_cv"] = {
+                    "config": cv_payload.get("config", {}),
+                    "models": {
+                        name: {"aggregated": payload.get("aggregated", {})}
+                        for name, payload in cv_payload.get("models", {}).items()
+                    },
+                }
+                continue
+            if model_name == "multi_horizon_evaluation":
+                mh_payload = model_results
+                serializable_results["multi_horizon_evaluation"] = {
+                    "config": mh_payload.get("config", {}),
+                    "accuracy_by_horizon": mh_payload.get("accuracy_by_horizon", []),
+                    "models": {
+                        name: {"horizon_summary": payload.get("horizon_summary", [])}
+                        for name, payload in mh_payload.get("models", {}).items()
+                    },
+                }
+                continue
+            if model_name == "forecast_quality":
+                serializable_results["forecast_quality"] = model_results
+                continue
+            if not isinstance(model_results, dict):
+                continue
             serializable_results[model_name] = {
-                "metrics": model_results.get("metrics", {})
+                "metrics": model_results.get("metrics", {}),
+                "cv_metrics": model_results.get("cv_metrics", {}),
+                "horizon_metrics": model_results.get("horizon_metrics", []),
             }
         import mlflow
 
@@ -223,14 +296,51 @@ def sales_forecast_training():
         mlflow_manager = MLflowManager()
         best_model_name = None
         best_rmse = float("inf")
+        best_cv_model = None
+        best_cv_rmse = float("inf")
         for model_name, model_results in results.items():
+            if model_name in ("rolling_origin_cv", "multi_horizon_evaluation", "forecast_quality"):
+                continue
+            if not isinstance(model_results, dict):
+                continue
             if "metrics" in model_results and "rmse" in model_results["metrics"]:
                 if model_results["metrics"]["rmse"] < best_rmse:
                     best_rmse = model_results["metrics"]["rmse"]
                     best_model_name = model_name
-        print(f"Best model: {best_model_name} with RMSE: {best_rmse:.4f}")
+            cv_metrics = model_results.get("cv_metrics") or {}
+            if "rmse_mean" in cv_metrics and cv_metrics["rmse_mean"] < best_cv_rmse:
+                best_cv_rmse = cv_metrics["rmse_mean"]
+                best_cv_model = model_name
+        print(f"Best holdout model: {best_model_name} with RMSE: {best_rmse:.4f}")
+        if best_cv_model is not None:
+            print(
+                f"Best rolling-origin CV model: {best_cv_model} "
+                f"with mean RMSE: {best_cv_rmse:.4f}"
+            )
+        mh = results.get("multi_horizon_evaluation") or {}
+        if mh.get("accuracy_by_horizon"):
+            # Best model at 7-day horizon by RMSE as a reference point
+            h7 = [
+                r for r in mh["accuracy_by_horizon"]
+                if int(r.get("horizon", -1)) == 7 and r.get("rmse") is not None
+            ]
+            if h7:
+                best_h7 = min(h7, key=lambda r: r["rmse"])
+                print(
+                    f"Best 7-day horizon model: {best_h7['model']} "
+                    f"RMSE={best_h7['rmse']:.4f}, bias={best_h7.get('bias', float('nan')):.4f}"
+                )
+        fq = results.get("forecast_quality") or {}
+        if fq.get("summary"):
+            print(f"Forecast quality gate: {fq.get('summary')}")
         best_run = mlflow_manager.get_best_model(metric="rmse", ascending=True)
-        return {"best_model": best_model_name, "best_run_id": best_run["run_id"]}
+        return {
+            "best_model": best_model_name,
+            "best_run_id": best_run["run_id"],
+            "best_cv_model": best_cv_model,
+            "best_cv_rmse": best_cv_rmse if best_cv_model is not None else None,
+            "forecast_quality_summary": fq.get("summary"),
+        }
 
     @task()
     def register_best_model_task(evaluation_result):
@@ -279,8 +389,24 @@ def sales_forecast_training():
         }
         if results:
             for model_name, model_results in results.items():
-                if "metrics" in model_results:
-                    report["model_performance"][model_name] = model_results["metrics"]
+                if model_name == "rolling_origin_cv":
+                    report["rolling_origin_cv"] = model_results
+                    continue
+                if model_name == "multi_horizon_evaluation":
+                    report["multi_horizon_evaluation"] = {
+                        "config": model_results.get("config", {}),
+                        "accuracy_by_horizon": model_results.get("accuracy_by_horizon", []),
+                    }
+                    continue
+                if model_name == "forecast_quality":
+                    report["forecast_quality"] = model_results
+                    continue
+                if isinstance(model_results, dict) and "metrics" in model_results:
+                    report["model_performance"][model_name] = {
+                        "holdout": model_results["metrics"],
+                        "rolling_origin_cv": model_results.get("cv_metrics", {}),
+                        "horizon_metrics": model_results.get("horizon_metrics", []),
+                    }
         import json
 
         with open("/tmp/performance_report.json", "w") as f:

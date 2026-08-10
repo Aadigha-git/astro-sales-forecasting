@@ -29,13 +29,16 @@ class ModelVisualizer:
             'xgboost': '#FF6B6B',
             'lightgbm': '#4ECDC4',
             'prophet': '#45B7D1',
+            'seasonal_naive': '#F39C12',
+            'holt_winters': '#9B59B6',
+            'sarimax': '#E67E22',
             'ensemble': '#96CEB4',
             'actual': '#2C3E50'
         }
         
     def create_metrics_comparison_chart(self, metrics_dict: Dict[str, Dict[str, float]], 
                                       save_path: Optional[str] = None) -> plt.Figure:
-        """Create a comparison chart for model metrics"""
+        """Create a comparison chart for MAE, RMSE, WAPE, and forecast bias."""
         
         # Prepare data
         models = list(metrics_dict.keys())
@@ -44,40 +47,46 @@ class ModelVisualizer:
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
         fig.suptitle('Model Performance Metrics Comparison', fontsize=16)
         
-        # Define metrics to plot
+        # MAE / RMSE / WAPE: lower is better; bias: closest to zero is best
         metrics_to_plot = [
-            ('rmse', 'RMSE', True, axes[0, 0]),
-            ('mae', 'MAE', True, axes[0, 1]),
-            ('mape', 'MAPE (%)', True, axes[1, 0]),
-            ('r2', 'R² Score', False, axes[1, 1])  # Higher is better for R²
+            ('mae', 'MAE', 'lower', axes[0, 0]),
+            ('rmse', 'RMSE', 'lower', axes[0, 1]),
+            ('wape', 'WAPE (%)', 'lower', axes[1, 0]),
+            ('bias', 'Forecast Bias (pred − actual)', 'closest_to_zero', axes[1, 1]),
         ]
         
-        for metric, title, lower_better, ax in metrics_to_plot:
-            values = [metrics_dict[model].get(metric, 0) for model in models]
+        for metric, title, best_mode, ax in metrics_to_plot:
+            values = [float(metrics_dict[model].get(metric, 0) or 0) for model in models]
             colors = [self.colors.get(model.lower(), '#95A5A6') for model in models]
             
-            # Create bar chart
             bars = ax.bar(models, values, color=colors, alpha=0.7)
             
-            # Add value labels on bars
             for bar, value in zip(bars, values):
                 height = bar.get_height()
+                va = 'bottom' if height >= 0 else 'top'
                 ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{value:.3f}', ha='center', va='bottom')
+                       f'{value:.3f}', ha='center', va=va, fontsize=8)
             
-            # Highlight best model
-            if lower_better:
-                best_idx = values.index(min(values))
-            else:
-                best_idx = values.index(max(values))
+            if best_mode == 'lower':
+                best_idx = int(np.argmin(values))
+            else:  # closest_to_zero
+                best_idx = int(np.argmin(np.abs(values)))
             
             bars[best_idx].set_edgecolor('green')
             bars[best_idx].set_linewidth(3)
             
             ax.set_title(f'{title} Comparison')
             ax.set_ylabel(title)
+            ax.tick_params(axis='x', rotation=30)
             ax.grid(True, alpha=0.3)
-            ax.set_ylim(0, max(values) * 1.15)  # Add space for labels
+            if metric == 'bias':
+                ax.axhline(0, color='black', linewidth=1, linestyle='--', alpha=0.6)
+                pad = max(abs(v) for v in values) * 0.2 if values else 1.0
+                pad = pad if pad > 0 else 1.0
+                ax.set_ylim(min(values) - pad, max(values) + pad)
+            else:
+                ymax = max(values) if values else 1.0
+                ax.set_ylim(min(0, min(values)), ymax * 1.15 if ymax > 0 else 1.0)
         
         plt.tight_layout()
         
@@ -87,7 +96,109 @@ class ModelVisualizer:
             logger.info(f"Saved metrics comparison chart to {save_path}")
         
         return fig
-    
+
+    def create_metrics_comparison_table(
+        self,
+        metrics_dict: Dict[str, Dict[str, float]],
+        save_path: Optional[str] = None,
+        csv_path: Optional[str] = None,
+        metrics: Optional[List[str]] = None,
+    ) -> Tuple[pd.DataFrame, plt.Figure]:
+        """
+        Build a ranked comparison table for MAE, RMSE, WAPE, and bias.
+
+        Saves a CSV (if csv_path) and a rendered table figure (if save_path).
+        """
+        metrics = metrics or ["mae", "rmse", "wape", "bias"]
+        rows = []
+        for model_name, model_metrics in metrics_dict.items():
+            row = {"model": model_name}
+            for m in metrics:
+                row[m] = float(model_metrics.get(m, np.nan))
+            rows.append(row)
+
+        table_df = pd.DataFrame(rows)
+        if not table_df.empty:
+            # Rank by MAE then RMSE (primary accuracy); bias abs as tie-breaker
+            table_df = table_df.sort_values(
+                by=["mae", "rmse", "wape"], ascending=True, na_position="last"
+            ).reset_index(drop=True)
+            table_df.insert(0, "rank", np.arange(1, len(table_df) + 1))
+
+            # Highlight helpers
+            table_df["abs_bias"] = table_df["bias"].abs()
+            best = {
+                "mae": table_df["mae"].idxmin() if table_df["mae"].notna().any() else None,
+                "rmse": table_df["rmse"].idxmin() if table_df["rmse"].notna().any() else None,
+                "wape": table_df["wape"].idxmin() if table_df["wape"].notna().any() else None,
+                "bias": table_df["abs_bias"].idxmin() if table_df["abs_bias"].notna().any() else None,
+            }
+        else:
+            best = {}
+
+        display_cols = ["rank", "model", "mae", "rmse", "wape", "bias"]
+        display_df = table_df[display_cols].copy() if not table_df.empty else table_df
+        for col in ["mae", "rmse", "wape", "bias"]:
+            if col in display_df.columns:
+                display_df[col] = display_df[col].map(
+                    lambda x: f"{x:.4f}" if pd.notna(x) else "—"
+                )
+
+        if csv_path and not table_df.empty:
+            export_df = table_df[["rank", "model", "mae", "rmse", "wape", "bias"]].copy()
+            export_df.to_csv(csv_path, index=False)
+            logger.info(f"Saved metrics comparison table CSV to {csv_path}")
+
+        fig, ax = plt.subplots(figsize=(11, max(2.5, 0.55 * max(len(display_df), 1) + 1.5)))
+        ax.axis("off")
+        ax.set_title(
+            "Model Comparison — MAE / RMSE / WAPE / Bias\n"
+            "(lower MAE/RMSE/WAPE better; bias closer to 0 better; +bias = over-forecast)",
+            fontsize=12,
+            pad=12,
+        )
+
+        if display_df.empty:
+            ax.text(0.5, 0.5, "No metrics available", ha="center", va="center")
+        else:
+            table = ax.table(
+                cellText=display_df.values,
+                colLabels=["Rank", "Model", "MAE", "RMSE", "WAPE (%)", "Bias"],
+                loc="center",
+                cellLoc="center",
+            )
+            table.auto_set_font_size(False)
+            table.set_fontsize(9)
+            table.scale(1.15, 1.4)
+
+            # Style header
+            for j in range(len(display_df.columns)):
+                table[(0, j)].set_facecolor("#2C3E50")
+                table[(0, j)].set_text_props(color="white", weight="bold")
+
+            # Color best cells lightly
+            col_index = {"mae": 2, "rmse": 3, "wape": 4, "bias": 5}
+            for metric_name, col_idx in col_index.items():
+                row_idx = best.get(metric_name)
+                if row_idx is None or pd.isna(row_idx):
+                    continue
+                # +1 for header row in matplotlib table
+                table[(int(row_idx) + 1, col_idx)].set_facecolor("#D5F5E3")
+
+            for i in range(1, len(display_df) + 1):
+                model_name = str(table_df.loc[i - 1, "model"]).lower()
+                color = self.colors.get(model_name, "#ECF0F1")
+                table[(i, 1)].set_facecolor(color)
+                table[(i, 1)].set_alpha(0.35)
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            plt.close()
+            logger.info(f"Saved metrics comparison table to {save_path}")
+
+        return table_df.drop(columns=["abs_bias"], errors="ignore"), fig
+
     def create_predictions_comparison_chart(self, predictions_dict: Dict[str, pd.DataFrame],
                                           actual_data: pd.DataFrame,
                                           date_col: str = 'date',
@@ -344,7 +455,9 @@ class ModelVisualizer:
                                   predictions_dict: Dict[str, pd.DataFrame],
                                   actual_data: pd.DataFrame,
                                   feature_importance_dict: Optional[Dict[str, pd.DataFrame]] = None,
-                                  save_dir: str = '/tmp/model_comparison_charts') -> Dict[str, str]:
+                                  save_dir: str = '/tmp/model_comparison_charts',
+                                  cv_results: Optional[Dict[str, Any]] = None,
+                                  horizon_results: Optional[Dict[str, Any]] = None) -> Dict[str, str]:
         """Generate all comparison charts and save them"""
         
         import os
@@ -352,12 +465,24 @@ class ModelVisualizer:
         
         saved_files = {}
         
-        # 1. Metrics comparison
+        # 1. Metrics comparison (MAE / RMSE / WAPE / bias)
         self.create_metrics_comparison_chart(
             metrics_dict,
             save_path=os.path.join(save_dir, 'metrics_comparison.png')
         )
         saved_files['metrics_comparison'] = os.path.join(save_dir, 'metrics_comparison.png')
+
+        # 1b. Metrics comparison table
+        table_png = os.path.join(save_dir, 'metrics_comparison_table.png')
+        table_csv = os.path.join(save_dir, 'metrics_comparison_table.csv')
+        self.create_metrics_comparison_table(
+            metrics_dict,
+            save_path=table_png,
+            csv_path=table_csv,
+            metrics=["mae", "rmse", "wape", "bias"],
+        )
+        saved_files['metrics_comparison_table'] = table_png
+        saved_files['metrics_comparison_table_csv'] = table_csv
         
         # 2. Predictions comparison
         self.create_predictions_comparison_chart(
@@ -390,6 +515,18 @@ class ModelVisualizer:
                 save_path=os.path.join(save_dir, 'feature_importance.png')
             )
             saved_files['feature_importance'] = os.path.join(save_dir, 'feature_importance.png')
+
+        # 6. Rolling-origin CV aggregates (if available)
+        if cv_results and cv_results.get("models"):
+            cv_path = os.path.join(save_dir, 'rolling_origin_cv.png')
+            self.create_rolling_origin_cv_chart(cv_results, save_path=cv_path)
+            saved_files['rolling_origin_cv'] = cv_path
+
+        # 7. Accuracy / bias vs forecast horizon
+        if horizon_results and horizon_results.get("accuracy_by_horizon"):
+            h_path = os.path.join(save_dir, 'horizon_accuracy.png')
+            self.create_horizon_accuracy_chart(horizon_results, save_path=h_path)
+            saved_files['horizon_accuracy'] = h_path
         
         # Create summary matplotlib figure
         self._create_summary_figure(metrics_dict, save_dir)
@@ -397,38 +534,176 @@ class ModelVisualizer:
         
         logger.info(f"Generated {len(saved_files)} visualization files in {save_dir}")
         return saved_files
-    
+
+    def create_horizon_accuracy_chart(
+        self,
+        horizon_results: Dict[str, Any],
+        save_path: Optional[str] = None,
+    ) -> plt.Figure:
+        """
+        Line charts showing how forecast accuracy and bias change with horizon.
+
+        X-axis: forecast horizon (days). Y-axis: RMSE / MAE / WAPE / bias.
+        One line per model.
+        """
+        rows = horizon_results.get("accuracy_by_horizon") or []
+        df = pd.DataFrame(rows)
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        horizons_cfg = horizon_results.get("config", {}).get("horizons", [])
+        fig.suptitle(
+            f"Forecast Accuracy vs Horizon ({', '.join(str(h) + 'd' for h in horizons_cfg) or 'multi-horizon'})",
+            fontsize=14,
+        )
+
+        specs = [
+            ("rmse", "RMSE (lower better)", axes[0, 0], False),
+            ("mae", "MAE (lower better)", axes[0, 1], False),
+            ("wape", "WAPE % (lower better)", axes[1, 0], False),
+            ("bias", "Forecast Bias (closer to 0 better)", axes[1, 1], True),
+        ]
+
+        if df.empty:
+            for _, _, ax, _ in specs:
+                ax.text(0.5, 0.5, "No horizon metrics", ha="center", va="center")
+                ax.axis("off")
+        else:
+            for metric, ylabel, ax, signed in specs:
+                for model_name, g in df.groupby("model"):
+                    g = g.sort_values("horizon")
+                    color = self.colors.get(str(model_name).lower(), "#95A5A6")
+                    y = g[metric].astype(float).values
+                    x = g["horizon"].astype(int).values
+                    yerr = g[f"{metric}_std"] if f"{metric}_std" in g.columns else None
+                    if yerr is not None:
+                        ax.errorbar(
+                            x,
+                            y,
+                            yerr=yerr.astype(float).values,
+                            marker="o",
+                            color=color,
+                            label=model_name,
+                            linewidth=2,
+                            capsize=3,
+                        )
+                    else:
+                        ax.plot(x, y, marker="o", color=color, label=model_name, linewidth=2)
+                ax.set_xlabel("Forecast horizon (days)")
+                ax.set_ylabel(ylabel)
+                ax.set_title(ylabel)
+                ax.grid(True, alpha=0.3)
+                if signed:
+                    ax.axhline(0, color="black", linestyle="--", linewidth=1, alpha=0.6)
+                # Integer-like ticks at evaluated horizons
+                xticks = sorted(df["horizon"].unique())
+                ax.set_xticks(xticks)
+                ax.legend(fontsize=8, loc="best")
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            plt.close()
+            logger.info(f"Saved horizon accuracy chart to {save_path}")
+        return fig
+
+    def create_rolling_origin_cv_chart(
+        self, cv_results: Dict[str, Any], save_path: Optional[str] = None
+    ) -> plt.Figure:
+        """Bar charts of mean±std for MAE, RMSE, WAPE, and bias across CV folds."""
+        models = []
+        series = {
+            "mae": ([], []),
+            "rmse": ([], []),
+            "wape": ([], []),
+            "bias": ([], []),
+        }
+
+        for model_name, payload in cv_results.get("models", {}).items():
+            agg = payload.get("aggregated", {})
+            if "rmse_mean" not in agg and "mae_mean" not in agg:
+                continue
+            models.append(model_name)
+            for metric in series:
+                series[metric][0].append(agg.get(f"{metric}_mean", 0.0))
+                series[metric][1].append(agg.get(f"{metric}_std", 0.0))
+
+        fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+        n_folds = cv_results.get("config", {}).get("n_folds", "?")
+        horizon = cv_results.get("config", {}).get("horizon", "?")
+        fig.suptitle(
+            f"Rolling-Origin CV — MAE / RMSE / WAPE / Bias "
+            f"(n_folds={n_folds}, horizon={horizon})",
+            fontsize=14,
+        )
+
+        plot_specs = [
+            ("mae", "MAE", axes[0, 0], False),
+            ("rmse", "RMSE", axes[0, 1], False),
+            ("wape", "WAPE (%)", axes[1, 0], False),
+            ("bias", "Forecast Bias", axes[1, 1], True),
+        ]
+
+        if models:
+            x = np.arange(len(models))
+            colors = [self.colors.get(m.lower(), "#95A5A6") for m in models]
+            for metric, ylabel, ax, signed in plot_specs:
+                means, stds = series[metric]
+                ax.bar(x, means, yerr=stds, color=colors, alpha=0.75, capsize=4)
+                ax.set_xticks(x)
+                ax.set_xticklabels(models, rotation=30, ha="right")
+                ax.set_ylabel(ylabel)
+                ax.set_title(f"{ylabel} mean ± std")
+                ax.grid(True, alpha=0.3)
+                if signed:
+                    ax.axhline(0, color="black", linewidth=1, linestyle="--", alpha=0.6)
+        else:
+            for _, _, ax, _ in plot_specs:
+                ax.text(0.5, 0.5, "No CV metrics", ha="center", va="center")
+                ax.axis("off")
+
+        plt.tight_layout()
+        if save_path:
+            plt.savefig(save_path, dpi=300, bbox_inches="tight")
+            plt.close()
+            logger.info(f"Saved rolling-origin CV chart to {save_path}")
+        return fig
+
     def _create_summary_figure(self, metrics_dict: Dict[str, Dict[str, float]], 
                               save_dir: str) -> None:
         """Create a summary figure using matplotlib"""
         
         fig, axes = plt.subplots(2, 2, figsize=(12, 10))
-        fig.suptitle('Model Performance Summary', fontsize=16)
+        fig.suptitle('Model Performance Summary (MAE / RMSE / WAPE / Bias)', fontsize=16)
         
         models = list(metrics_dict.keys())
-        metrics = ['rmse', 'mae', 'mape', 'r2']
+        metric_specs = [
+            ('mae', 'MAE', 'lower'),
+            ('rmse', 'RMSE', 'lower'),
+            ('wape', 'WAPE (%)', 'lower'),
+            ('bias', 'Forecast Bias', 'closest_to_zero'),
+        ]
         
-        for idx, (ax, metric) in enumerate(zip(axes.flat, metrics)):
-            values = [metrics_dict[model].get(metric, 0) for model in models]
+        for ax, (metric, label, best_mode) in zip(axes.flat, metric_specs):
+            values = [float(metrics_dict[model].get(metric, 0) or 0) for model in models]
             colors = [self.colors.get(model.lower(), '#95A5A6') for model in models]
             
             bars = ax.bar(models, values, color=colors, alpha=0.7)
             
-            # Add value labels
             for bar, value in zip(bars, values):
                 height = bar.get_height()
+                va = 'bottom' if height >= 0 else 'top'
                 ax.text(bar.get_x() + bar.get_width()/2., height,
-                       f'{value:.3f}', ha='center', va='bottom')
+                       f'{value:.3f}', ha='center', va=va, fontsize=8)
             
-            ax.set_title(f'{metric.upper()} Comparison')
-            ax.set_ylabel(metric.upper())
+            ax.set_title(f'{label} Comparison')
+            ax.set_ylabel(label)
+            ax.tick_params(axis='x', rotation=30)
             ax.grid(True, alpha=0.3)
             
-            # Highlight best model
-            if metric == 'r2':  # Higher is better
-                best_idx = values.index(max(values))
-            else:  # Lower is better
-                best_idx = values.index(min(values))
+            if best_mode == 'closest_to_zero':
+                best_idx = int(np.argmin(np.abs(values))) if values else 0
+                ax.axhline(0, color='black', linewidth=1, linestyle='--', alpha=0.6)
+            else:
+                best_idx = int(np.argmin(values)) if values else 0
             bars[best_idx].set_edgecolor('green')
             bars[best_idx].set_linewidth(3)
         
@@ -451,9 +726,12 @@ def generate_model_comparison_report(mlflow_manager, run_id: str,
     
     # Extract metrics
     metrics_dict = {}
-    for model in ['xgboost', 'lightgbm', 'ensemble']:
+    for model in [
+        'xgboost', 'lightgbm', 'prophet',
+        'seasonal_naive', 'holt_winters', 'sarimax', 'ensemble'
+    ]:
         model_metrics = {}
-        for metric in ['rmse', 'mae', 'mape', 'r2']:
+        for metric in ['rmse', 'mae', 'mape', 'wape', 'bias', 'r2']:
             metric_key = f"{model}_{metric}"
             if metric_key in run.data.metrics:
                 model_metrics[metric] = run.data.metrics[metric_key]

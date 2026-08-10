@@ -426,3 +426,375 @@ class RealisticSalesDataGenerator:
         logger.info(f"Output directory: {output_dir}")
         
         return file_paths
+
+
+class ContactCenterDemandGenerator:
+    """
+    Generate synthetic contact-center operational demand data.
+
+    Produces hourly records with timestamp, business unit, channel, volume,
+    average handle time (AHT), day-of-week, hour-of-day, holiday indicators,
+    and realistic intraday / weekly / seasonal demand patterns.
+    """
+
+    def __init__(
+        self,
+        start_date: str = "2022-01-01",
+        end_date: str = "2023-12-31",
+        seed: Optional[int] = 42,
+    ):
+        self.start_date = pd.to_datetime(start_date).normalize()
+        self.end_date = pd.to_datetime(end_date).normalize()
+        self.us_holidays = holidays.US()
+        self.rng = np.random.default_rng(seed)
+
+        # Business units with baseline hourly offered volume and AHT (seconds)
+        self.business_units = {
+            "sales_support": {
+                "base_volume": 42,
+                "base_aht_seconds": 320,
+                "seasonality": "retail",
+            },
+            "billing": {
+                "base_volume": 55,
+                "base_aht_seconds": 420,
+                "seasonality": "billing",
+            },
+            "technical_support": {
+                "base_volume": 70,
+                "base_aht_seconds": 540,
+                "seasonality": "tech",
+            },
+            "retention": {
+                "base_volume": 28,
+                "base_aht_seconds": 600,
+                "seasonality": "retention",
+            },
+            "general_inquiry": {
+                "base_volume": 35,
+                "base_aht_seconds": 240,
+                "seasonality": "all_year",
+            },
+        }
+
+        # Channel mix + relative volume / AHT multipliers
+        self.channels = {
+            "voice": {"volume_share": 0.55, "aht_multiplier": 1.00, "weekend_factor": 0.55},
+            "chat": {"volume_share": 0.25, "aht_multiplier": 0.55, "weekend_factor": 0.85},
+            "email": {"volume_share": 0.15, "aht_multiplier": 1.40, "weekend_factor": 0.70},
+            "social": {"volume_share": 0.05, "aht_multiplier": 0.70, "weekend_factor": 1.10},
+        }
+
+        # Typical contact-center intraday profile (hour -> multiplier)
+        self.hour_of_day_profile = {
+            0: 0.08, 1: 0.05, 2: 0.04, 3: 0.04, 4: 0.05, 5: 0.10,
+            6: 0.25, 7: 0.55, 8: 0.85, 9: 1.20, 10: 1.35, 11: 1.25,
+            12: 0.95, 13: 1.15, 14: 1.30, 15: 1.25, 16: 1.10, 17: 0.90,
+            18: 0.70, 19: 0.55, 20: 0.40, 21: 0.28, 22: 0.18, 23: 0.12,
+        }
+
+        # Monday=0 ... Sunday=6
+        self.day_of_week_profile = {
+            0: 1.20,  # Monday spike
+            1: 1.05,
+            2: 1.00,
+            3: 0.98,
+            4: 0.95,
+            5: 0.55,
+            6: 0.45,
+        }
+
+    def _is_holiday(self, ts: pd.Timestamp) -> bool:
+        return ts.normalize() in self.us_holidays
+
+    def _holiday_name(self, ts: pd.Timestamp) -> Optional[str]:
+        day = ts.normalize()
+        if day in self.us_holidays:
+            return str(self.us_holidays.get(day))
+        return None
+
+    def _seasonality_factor(self, ts: pd.Timestamp, seasonality_type: str) -> float:
+        month = ts.month
+        if seasonality_type == "retail":
+            # Higher demand around holidays / year-end shopping
+            if month in (11, 12):
+                return 1.35
+            if month in (1, 7):
+                return 1.10
+            return 1.0
+        if seasonality_type == "billing":
+            # Month-start billing cycles + tax season
+            day = ts.day
+            factor = 1.25 if day <= 5 else (1.10 if day >= 28 else 1.0)
+            if month in (3, 4):
+                factor *= 1.20
+            return factor
+        if seasonality_type == "tech":
+            # Product launches / back-to-school / new-year device spikes
+            if month in (1, 8, 9):
+                return 1.25
+            if month in (11, 12):
+                return 1.15
+            return 1.0
+        if seasonality_type == "retention":
+            # Competitive switch seasons
+            if month in (1, 6, 7):
+                return 1.20
+            return 1.0
+        return 1.0
+
+    def _holiday_volume_factor(self, ts: pd.Timestamp, channel: str) -> float:
+        """Holidays suppress live channels; email backlog often rises next day."""
+        if not self._is_holiday(ts):
+            # Day-after-holiday catch-up
+            yesterday = (ts.normalize() - timedelta(days=1))
+            if yesterday in self.us_holidays:
+                return 1.25 if channel in ("voice", "chat") else 1.15
+            return 1.0
+        if channel == "voice":
+            return 0.35
+        if channel == "chat":
+            return 0.50
+        if channel == "social":
+            return 0.80
+        return 0.90  # email
+
+    def _trend_factor(self, ts: pd.Timestamp) -> float:
+        """Mild growth in offered volume over the generation window."""
+        total_days = max((self.end_date - self.start_date).days, 1)
+        elapsed = (ts.normalize() - self.start_date).days
+        return 1.0 + 0.15 * (elapsed / total_days)
+
+    def _sample_volume(
+        self,
+        base_volume: float,
+        hour_factor: float,
+        dow_factor: float,
+        season_factor: float,
+        holiday_factor: float,
+        channel_share: float,
+        weekend_factor: float,
+        trend_factor: float,
+        is_weekend: bool,
+    ) -> int:
+        weekend_adj = weekend_factor if is_weekend else 1.0
+        expected = (
+            base_volume
+            * hour_factor
+            * dow_factor
+            * season_factor
+            * holiday_factor
+            * channel_share
+            * weekend_adj
+            * trend_factor
+        )
+        # Over-dispersed count noise (approx. negative-binomial via gamma-poisson)
+        if expected <= 0:
+            return 0
+        lam = self.rng.gamma(shape=max(expected / 2.0, 1e-3), scale=2.0)
+        return int(max(0, self.rng.poisson(lam)))
+
+    def _sample_aht_seconds(
+        self,
+        base_aht: float,
+        aht_multiplier: float,
+        hour: int,
+        volume: int,
+        is_holiday: bool,
+    ) -> float:
+        # Longer handle times at open/close and on sparse/holiday intervals
+        open_close = 1.15 if hour in (8, 9, 17, 18) else 1.0
+        sparse = 1.10 if volume < 5 else 1.0
+        holiday_adj = 1.08 if is_holiday else 1.0
+        noise = float(self.rng.normal(1.0, 0.08))
+        aht = base_aht * aht_multiplier * open_close * sparse * holiday_adj * noise
+        return float(max(30.0, round(aht, 1)))
+
+    def generate_demand_frame(self) -> pd.DataFrame:
+        """Return a single DataFrame of hourly contact-center demand records."""
+        timestamps = pd.date_range(
+            self.start_date,
+            self.end_date + pd.Timedelta(hours=23),
+            freq="h",
+        )
+        records: List[Dict] = []
+
+        for ts in timestamps:
+            hour = int(ts.hour)
+            dow = int(ts.dayofweek)
+            is_weekend = dow >= 5
+            is_holiday = self._is_holiday(ts)
+            holiday_name = self._holiday_name(ts)
+            hour_factor = self.hour_of_day_profile[hour]
+            dow_factor = self.day_of_week_profile[dow]
+            trend = self._trend_factor(ts)
+
+            for bu_name, bu_cfg in self.business_units.items():
+                season = self._seasonality_factor(ts, bu_cfg["seasonality"])
+                for channel, ch_cfg in self.channels.items():
+                    holiday_factor = self._holiday_volume_factor(ts, channel)
+                    volume = self._sample_volume(
+                        base_volume=bu_cfg["base_volume"],
+                        hour_factor=hour_factor,
+                        dow_factor=dow_factor,
+                        season_factor=season,
+                        holiday_factor=holiday_factor,
+                        channel_share=ch_cfg["volume_share"],
+                        weekend_factor=ch_cfg["weekend_factor"],
+                        trend_factor=trend,
+                        is_weekend=is_weekend,
+                    )
+                    aht = self._sample_aht_seconds(
+                        base_aht=bu_cfg["base_aht_seconds"],
+                        aht_multiplier=ch_cfg["aht_multiplier"],
+                        hour=hour,
+                        volume=volume,
+                        is_holiday=is_holiday,
+                    )
+                    records.append(
+                        {
+                            "timestamp": ts,
+                            "business_unit": bu_name,
+                            "channel": channel,
+                            "volume": volume,
+                            "average_handle_time": aht,
+                            "day_of_week": dow,
+                            "day_of_week_name": ts.day_name(),
+                            "hour_of_day": hour,
+                            "is_holiday": is_holiday,
+                            "holiday_name": holiday_name,
+                            "is_weekend": is_weekend,
+                            "date": ts.normalize(),
+                        }
+                    )
+
+        df = pd.DataFrame.from_records(records)
+        # Stable column order for consumers
+        column_order = [
+            "timestamp",
+            "business_unit",
+            "channel",
+            "volume",
+            "average_handle_time",
+            "day_of_week",
+            "day_of_week_name",
+            "hour_of_day",
+            "is_holiday",
+            "holiday_name",
+            "is_weekend",
+            "date",
+        ]
+        return df[column_order]
+
+    def generate_contact_center_data(
+        self, output_dir: str = "/tmp/contact_center_data"
+    ) -> Dict[str, List[str]]:
+        """
+        Generate and persist contact-center demand data.
+
+        Writes daily parquet partitions under contact_center/ plus a combined
+        file and generation metadata. Sales generation is untouched.
+        """
+        os.makedirs(output_dir, exist_ok=True)
+        logger.info(
+            f"Generating contact-center demand data from "
+            f"{self.start_date.date()} to {self.end_date.date()}"
+        )
+
+        df = self.generate_demand_frame()
+        file_paths: Dict[str, List[str]] = {
+            "contact_center": [],
+            "contact_center_daily": [],
+        }
+
+        # Combined dataset for convenient loading
+        combined_path = os.path.join(
+            output_dir, "contact_center/contact_center_demand.parquet"
+        )
+        os.makedirs(os.path.dirname(combined_path), exist_ok=True)
+        df.to_parquet(combined_path, index=False)
+        file_paths["contact_center"].append(combined_path)
+
+        # Daily partitions (mirror sales-style layout)
+        for day, day_df in df.groupby("date", sort=True):
+            day_ts = pd.Timestamp(day)
+            date_str = day_ts.strftime("%Y-%m-%d")
+            daily_path = os.path.join(
+                output_dir,
+                f"contact_center_daily/year={day_ts.year}/"
+                f"month={day_ts.month:02d}/day={day_ts.day:02d}/"
+                f"demand_{date_str}.parquet",
+            )
+            os.makedirs(os.path.dirname(daily_path), exist_ok=True)
+            day_df.to_parquet(daily_path, index=False)
+            file_paths["contact_center_daily"].append(daily_path)
+
+        metadata = {
+            "generation_date": datetime.now().isoformat(),
+            "dataset_type": "contact_center",
+            "start_date": self.start_date.isoformat(),
+            "end_date": self.end_date.isoformat(),
+            "n_business_units": len(self.business_units),
+            "n_channels": len(self.channels),
+            "n_rows": int(len(df)),
+            "file_counts": {k: len(v) for k, v in file_paths.items()},
+            "total_files": sum(len(v) for v in file_paths.values()),
+            "columns": list(df.columns),
+        }
+        metadata_path = os.path.join(
+            output_dir, "metadata/contact_center_generation_metadata.parquet"
+        )
+        os.makedirs(os.path.dirname(metadata_path), exist_ok=True)
+        pd.DataFrame([metadata]).to_parquet(metadata_path, index=False)
+
+        logger.info(
+            f"Generated contact-center dataset with {len(df)} rows "
+            f"across {metadata['total_files']} files in {output_dir}"
+        )
+        return file_paths
+
+
+def generate_synthetic_data(
+    dataset: str = "sales",
+    start_date: str = "2022-01-01",
+    end_date: str = "2023-12-31",
+    sales_output_dir: str = "/tmp/sales_data",
+    contact_center_output_dir: str = "/tmp/contact_center_data",
+    seed: Optional[int] = 42,
+) -> Dict[str, Dict[str, List[str]]]:
+    """
+    Optionally generate sales and/or contact-center synthetic datasets.
+
+    Args:
+        dataset: One of ``"sales"``, ``"contact_center"``, or ``"both"``.
+        start_date / end_date: Inclusive generation window.
+        sales_output_dir: Output root for the existing sales generator.
+        contact_center_output_dir: Output root for contact-center demand.
+        seed: RNG seed for contact-center generation.
+
+    Returns:
+        Mapping of dataset name -> file_paths dict from the respective generator.
+        Existing sales behavior is unchanged when ``dataset`` is ``"sales"``.
+    """
+    dataset = dataset.lower().strip()
+    allowed = {"sales", "contact_center", "both"}
+    if dataset not in allowed:
+        raise ValueError(f"dataset must be one of {sorted(allowed)}, got {dataset!r}")
+
+    results: Dict[str, Dict[str, List[str]]] = {}
+
+    if dataset in ("sales", "both"):
+        sales_gen = RealisticSalesDataGenerator(
+            start_date=start_date, end_date=end_date
+        )
+        results["sales"] = sales_gen.generate_sales_data(output_dir=sales_output_dir)
+
+    if dataset in ("contact_center", "both"):
+        cc_gen = ContactCenterDemandGenerator(
+            start_date=start_date, end_date=end_date, seed=seed
+        )
+        results["contact_center"] = cc_gen.generate_contact_center_data(
+            output_dir=contact_center_output_dir
+        )
+
+    return results

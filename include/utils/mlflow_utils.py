@@ -30,18 +30,20 @@ class MLflowManager:
         self.registry_name = mlflow_config['registry_name']
         
         mlflow.set_tracking_uri(self.tracking_uri)
-        
-        # Try to create experiment, with fallback
+        os.environ["MLFLOW_TRACKING_URI"] = self.tracking_uri
+
+        # Try to create experiment (service_discovery already probed reachable URIs)
         try:
             mlflow.set_experiment(self.experiment_name)
         except Exception as e:
             logger.warning(f"Failed to set experiment {self.experiment_name}: {e}")
-            # Try with localhost if initial connection failed
-            if 'mlflow' in self.tracking_uri:
-                self.tracking_uri = "http://localhost:5001"
+            # Re-discover in case DNS/network healed or host gateway works
+            fallback = get_mlflow_endpoint()
+            if fallback != self.tracking_uri:
+                self.tracking_uri = fallback
                 mlflow.set_tracking_uri(self.tracking_uri)
-                os.environ['MLFLOW_TRACKING_URI'] = self.tracking_uri
-                logger.info(f"Retrying with localhost: {self.tracking_uri}")
+                os.environ["MLFLOW_TRACKING_URI"] = self.tracking_uri
+                logger.info(f"Retrying MLflow at: {self.tracking_uri}")
                 try:
                     mlflow.set_experiment(self.experiment_name)
                 except Exception as e2:

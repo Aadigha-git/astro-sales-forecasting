@@ -4,26 +4,24 @@ A Streamlit-based web interface for sales forecasting using trained ML models.
 
 ## Features
 
-- 🔮 **Model Inference**: Generate sales forecasts using trained models
-- 📊 **Multiple Input Methods**: Upload CSV, manual entry, or use sample data
-- 📈 **Interactive Visualizations**: View predictions with confidence intervals
-- 🤖 **Model Selection**: Choose between ensemble, XGBoost, or LightGBM
-- 💾 **Export Results**: Download predictions as CSV
-- 🎯 **Real-time Predictions**: Get instant forecasts with loaded models
+- **Model Inference**: Generate sales forecasts using trained models
+- **Staffing Plan**: Forecasted demand, intervals, required agents, staffing gap
+- **Model Comparison**: Holdout MAE/RMSE/WAPE/bias, multi-horizon, quality gates
+- **Multiple Input Methods**: Upload CSV, manual entry, or use sample data
+- **Interactive Visualizations**: View predictions with confidence intervals
+- **Model Selection**: Choose between ensemble, XGBoost, or LightGBM
+- **Export Results**: Download predictions / staffing plans as CSV
 
 ## Quick Start
 
-### Using Docker Compose (Recommended)
-
-The UI is included in the main docker-compose setup:
+### With Astronomer (recommended)
 
 ```bash
-# Start all services including UI
-docker-compose -f docker-compose.override.yml up -d
-
-# Access the UI
+astro dev start
 open http://localhost:8501
 ```
+
+Dependencies are baked into `astro-salesforecast-streamlit:1.32.2`. Code under `ui/` is volume-mounted, so Python edits do not rebuild the image. Rebuild only when `requirements.txt` or `Dockerfile.streamlit` change.
 
 ### Local Development
 

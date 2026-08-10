@@ -227,7 +227,14 @@ class ModelComparison:
     def evaluate_and_promote(
         self,
         candidate_run_id: str,
-        model_names: list = ["xgboost", "lightgbm", "ensemble"],
+        model_names: list = [
+            "xgboost",
+            "lightgbm",
+            "seasonal_naive",
+            "holt_winters",
+            "sarimax",
+            "ensemble",
+        ],
         test_data: Optional[pd.DataFrame] = None,
         force_first_deployment: bool = False
     ) -> Dict[str, Any]:

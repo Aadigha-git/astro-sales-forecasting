@@ -85,7 +85,11 @@ def diagnose_model_performance(train_df: pd.DataFrame,
                 'extreme_high_count': extreme_high,
                 'residual_mean': residuals.mean(),
                 'residual_std': residuals.std(),
-                'mape': np.mean(np.abs(residuals / y_test)) * 100
+                'mape': np.mean(np.abs(residuals / np.where(np.abs(y_test) < 1e-8, np.nan, y_test))) * 100,
+                'wape': (np.sum(np.abs(residuals)) / np.sum(np.abs(y_test)) * 100)
+                        if np.sum(np.abs(y_test)) > 0 else np.nan,
+                # Forecast bias: mean(pred - actual); positive => over-forecast
+                'bias': float(np.mean(pred - y_test)),
             }
     
     # 4. Feature importance check

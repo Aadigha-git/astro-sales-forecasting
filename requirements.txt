@@ -9,6 +9,7 @@ xgboost
 lightgbm
 prophet
 statsmodels
+pyarrow
 
 # MLflow for experiment tracking
 mlflow
@@ -50,5 +51,5 @@ optuna
 shap
 holidays
 
-# UI
+# UI (also used by Streamlit sidecar via its own image)
 streamlit

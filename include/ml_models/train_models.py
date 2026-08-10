@@ -12,7 +12,6 @@ from sklearn.preprocessing import StandardScaler, LabelEncoder
 
 import xgboost as xgb
 import lightgbm as lgb
-from prophet import Prophet
 import optuna
 import mlflow
 
@@ -22,8 +21,28 @@ from data_validation.validators import DataValidator
 from ml_models.advanced_ensemble import AdvancedEnsemble
 from ml_models.diagnostics import diagnose_model_performance
 from ml_models.ensemble_model import EnsembleModel
+from ml_models.classical_ts_models import (
+    SeasonalNaiveModel,
+    HoltWintersModel,
+    SARIMAXModel,
+    build_model_from_config,
+)
+from ml_models.rolling_origin_cv import RollingOriginEvaluator
+from ml_models.horizon_evaluation import (
+    MultiHorizonEvaluator,
+    DEFAULT_HORIZONS,
+    horizon_summary_frame,
+)
+from ml_models.forecast_quality import (
+    ForecastQualityChecker,
+    flatten_quality_metrics,
+    write_quality_artifacts,
+)
 
 logger = logging.getLogger(__name__)
+
+# Models that participate in comparison / ensemble evaluation when enabled
+CLASSICAL_TS_MODELS = ("seasonal_naive", "holt_winters", "sarimax")
 
 
 class ModelTrainer:
@@ -134,13 +153,27 @@ class ModelTrainer:
         return X_train_scaled, X_val_scaled, X_test_scaled, y_train, y_val, y_test
     
     def calculate_metrics(self, y_true: np.ndarray, y_pred: np.ndarray) -> Dict[str, float]:
-        metrics = {
-            'rmse': np.sqrt(mean_squared_error(y_true, y_pred)),
-            'mae': mean_absolute_error(y_true, y_pred),
-            'mape': np.mean(np.abs((y_true - y_pred) / y_true)) * 100,
-            'r2': r2_score(y_true, y_pred)
+        y_true = np.asarray(y_true, dtype=float).ravel()
+        y_pred = np.asarray(y_pred, dtype=float).ravel()
+
+        abs_err = np.abs(y_true - y_pred)
+        actual_sum = np.sum(np.abs(y_true))
+        # WAPE: sum(|error|) / sum(|actual|) * 100
+        wape = float(np.sum(abs_err) / actual_sum * 100) if actual_sum > 0 else float("nan")
+        # Forecast bias: mean(pred - actual); positive => over-forecast
+        bias = float(np.mean(y_pred - y_true))
+
+        mape_denom = np.where(np.abs(y_true) < 1e-8, np.nan, y_true)
+        mape = float(np.nanmean(np.abs((y_true - y_pred) / mape_denom)) * 100)
+
+        return {
+            "rmse": float(np.sqrt(mean_squared_error(y_true, y_pred))),
+            "mae": float(mean_absolute_error(y_true, y_pred)),
+            "mape": mape,
+            "wape": wape,
+            "bias": bias,
+            "r2": float(r2_score(y_true, y_pred)) if len(y_true) >= 2 else float("nan"),
         }
-        return metrics
     
     def train_xgboost(self, X_train: np.ndarray, y_train: np.ndarray,
                      X_val: np.ndarray, y_val: np.ndarray,
@@ -240,8 +273,10 @@ class ModelTrainer:
         return model
     
     def train_prophet(self, train_df: pd.DataFrame, val_df: pd.DataFrame,
-                     date_col: str = 'date', target_col: str = 'sales') -> Prophet:
+                     date_col: str = 'date', target_col: str = 'sales') -> Any:
         
+        from prophet import Prophet
+
         logger.info("Training Prophet model")
         
         # Prepare data for Prophet
@@ -308,7 +343,368 @@ class ModelTrainer:
             
             self.models['prophet'] = model
             return model
-    
+
+    def train_seasonal_naive(
+        self, y_history: np.ndarray, season_length: Optional[int] = None
+    ) -> SeasonalNaiveModel:
+        logger.info("Training Seasonal Naive model")
+        params = dict(self.model_config.get("seasonal_naive", {}).get("params", {}))
+        if season_length is not None:
+            params["season_length"] = season_length
+        model = build_model_from_config("seasonal_naive", params)
+        model.fit(y_history)
+        self.models["seasonal_naive"] = model
+        return model
+
+    def train_holt_winters(self, y_history: np.ndarray) -> HoltWintersModel:
+        logger.info("Training Holt-Winters (Exponential Smoothing) model")
+        params = dict(self.model_config.get("holt_winters", {}).get("params", {}))
+        model = build_model_from_config("holt_winters", params)
+        model.fit(y_history)
+        self.models["holt_winters"] = model
+        return model
+
+    def train_sarimax(self, y_history: np.ndarray) -> SARIMAXModel:
+        logger.info("Training SARIMAX model")
+        params = dict(self.model_config.get("sarimax", {}).get("params", {}))
+        model = build_model_from_config("sarimax", params)
+        model.fit(y_history)
+        self.models["sarimax"] = model
+        return model
+
+    def _is_model_enabled(self, model_name: str, default: bool = False) -> bool:
+        return bool(self.model_config.get(model_name, {}).get("enabled", default))
+
+    def _train_classical_ts_models(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+        y_test: np.ndarray,
+        target_col: str,
+    ) -> Dict[str, Dict[str, Any]]:
+        """Train enabled classical TS baselines and return results for comparison/ensemble."""
+        classical_results: Dict[str, Dict[str, Any]] = {}
+        y_train = train_df[target_col].astype(float).values
+        y_train_val = pd.concat([train_df, val_df], ignore_index=True)[target_col].astype(float).values
+        n_val = len(val_df)
+        n_test = len(test_df)
+
+        trainers = {
+            "seasonal_naive": self.train_seasonal_naive,
+            "holt_winters": self.train_holt_winters,
+            "sarimax": self.train_sarimax,
+        }
+
+        for model_name, train_fn in trainers.items():
+            if not self._is_model_enabled(model_name, default=False):
+                logger.info(f"{model_name} disabled in config; skipping")
+                continue
+
+            try:
+                # Val forecast from train-only fit (for ensemble weights)
+                model_val = train_fn(y_train)
+                val_pred = model_val.predict(n_val)
+
+                # Test forecast from train+val fit (more history for final evaluation)
+                model = train_fn(y_train_val)
+                test_pred = model.predict(n_test)
+                metrics = self.calculate_metrics(y_test, test_pred)
+
+                self.mlflow_manager.log_metrics(
+                    {f"{model_name}_{k}": v for k, v in metrics.items()}
+                )
+                try:
+                    self.mlflow_manager.log_model(model, model_name)
+                except Exception as log_err:
+                    logger.warning(f"Could not log {model_name} to MLflow as model artifact: {log_err}")
+
+                classical_results[model_name] = {
+                    "model": model,
+                    "metrics": metrics,
+                    "predictions": test_pred,
+                    "val_predictions": val_pred,
+                }
+                logger.info(
+                    f"{model_name} metrics - RMSE: {metrics['rmse']:.4f}, "
+                    f"MAE: {metrics['mae']:.4f}, WAPE: {metrics['wape']:.4f}, "
+                    f"Bias: {metrics['bias']:.4f}, R2: {metrics['r2']:.4f}"
+                )
+            except Exception as e:
+                logger.warning(f"{model_name} training failed: {e}", exc_info=True)
+
+        return classical_results
+
+    @staticmethod
+    def _compute_ensemble_weights(
+        val_scores: Dict[str, float], min_weight: float = 0.05
+    ) -> Dict[str, float]:
+        """Convert validation R² scores into normalized ensemble weights."""
+        # Shift R² into a positive range so poor models still get a small weight
+        shifted = {name: max(0.0, score) + 1e-6 for name, score in val_scores.items()}
+        total = sum(shifted.values())
+        weights = {name: max(min_weight, score / total) for name, score in shifted.items()}
+        weight_sum = sum(weights.values())
+        return {name: w / weight_sum for name, w in weights.items()}
+
+    def run_rolling_origin_cv(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        target_col: str = "sales",
+        date_col: str = "date",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Rolling-origin CV on train+validation only (final test holdout preserved).
+
+        Returns aggregated + per-fold metrics for each evaluated model, or None if disabled.
+        """
+        cv_cfg = dict(self.training_config.get("rolling_origin_cv", {}) or {})
+        if not cv_cfg.get("enabled", False):
+            logger.info("Rolling-origin CV disabled in config")
+            return None
+
+        cv_data = pd.concat([train_df, val_df], ignore_index=True)
+        cv_data = cv_data.sort_values(date_col).reset_index(drop=True)
+
+        n_splits = int(cv_cfg.get("n_splits") or self.training_config.get("cv_folds", 5))
+        horizon = cv_cfg.get("horizon")
+        if horizon is None:
+            horizon = self.config.get("inference", {}).get("prediction_horizon", 30)
+        horizon = int(horizon)
+        step = cv_cfg.get("step")
+        step = int(step) if step is not None else None
+        min_train_size = cv_cfg.get("min_train_size")
+        min_train_size = int(min_train_size) if min_train_size is not None else None
+
+        self.mlflow_manager.log_params(
+            {
+                "cv_n_splits": n_splits,
+                "cv_horizon": horizon,
+                "cv_step": step if step is not None else horizon,
+                "cv_n_samples": len(cv_data),
+            }
+        )
+
+        evaluator = RollingOriginEvaluator(
+            model_config=self.model_config,
+            metrics_fn=self.calculate_metrics,
+        )
+
+        try:
+            cv_results = evaluator.evaluate(
+                df=cv_data,
+                target_col=target_col,
+                date_col=date_col,
+                n_splits=n_splits,
+                horizon=horizon,
+                min_train_size=min_train_size,
+                step=step,
+            )
+        except Exception as e:
+            logger.warning(f"Rolling-origin CV failed: {e}", exc_info=True)
+            return None
+
+        # Log aggregated metrics to MLflow
+        flat_metrics = {}
+        for model_name, model_cv in cv_results.get("models", {}).items():
+            for metric_name, value in model_cv.get("aggregated", {}).items():
+                flat_metrics[f"{model_name}_cv_{metric_name}"] = float(value)
+        if flat_metrics:
+            self.mlflow_manager.log_metrics(flat_metrics)
+
+        # Persist fold table for later inspection
+        try:
+            import os
+
+            rows = []
+            for model_name, model_cv in cv_results.get("models", {}).items():
+                for fold in model_cv.get("folds", []):
+                    row = {
+                        "model": model_name,
+                        "fold_id": fold["fold_id"],
+                        "train_end": fold["train_end"],
+                        "test_start": fold["test_start"],
+                        "test_end": fold["test_end"],
+                        "horizon": fold["horizon"],
+                        "train_size": fold["train_size"],
+                    }
+                    row.update(fold.get("metrics", {}))
+                    rows.append(row)
+            if rows:
+                fold_df = pd.DataFrame(rows)
+                cv_dir = "/tmp/rolling_origin_cv"
+                os.makedirs(cv_dir, exist_ok=True)
+                fold_path = os.path.join(cv_dir, "fold_metrics.csv")
+                fold_df.to_csv(fold_path, index=False)
+                agg_rows = []
+                for model_name, model_cv in cv_results.get("models", {}).items():
+                    agg = {"model": model_name}
+                    agg.update(model_cv.get("aggregated", {}))
+                    agg_rows.append(agg)
+                agg_path = os.path.join(cv_dir, "aggregated_metrics.csv")
+                pd.DataFrame(agg_rows).to_csv(agg_path, index=False)
+                self.mlflow_manager.log_artifacts(cv_dir)
+        except Exception as art_err:
+            logger.warning(f"Could not persist rolling-origin CV artifacts: {art_err}")
+
+        return cv_results
+
+    def run_multi_horizon_evaluation(
+        self,
+        train_df: pd.DataFrame,
+        val_df: pd.DataFrame,
+        target_col: str = "sales",
+        date_col: str = "date",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Evaluate accuracy and bias at 1 / 3 / 7 / 14-day horizons on train+val.
+
+        Holdout test remains untouched. Results include per-model horizon summaries
+        suitable for MLflow logging and horizon-vs-accuracy charts.
+        """
+        mh_cfg = dict(self.training_config.get("multi_horizon_evaluation", {}) or {})
+        if not mh_cfg.get("enabled", True):
+            logger.info("Multi-horizon evaluation disabled in config")
+            return None
+
+        horizons = mh_cfg.get("horizons") or list(DEFAULT_HORIZONS)
+        horizons = [int(h) for h in horizons]
+        n_splits = int(
+            mh_cfg.get("n_splits")
+            or self.training_config.get("rolling_origin_cv", {}).get("n_splits")
+            or self.training_config.get("cv_folds", 5)
+        )
+        step = mh_cfg.get("step")
+        step = int(step) if step is not None else None
+        min_train_size = mh_cfg.get("min_train_size")
+        min_train_size = int(min_train_size) if min_train_size is not None else None
+        aggregate_daily = bool(mh_cfg.get("aggregate_daily", True))
+
+        cv_data = pd.concat([train_df, val_df], ignore_index=True)
+
+        self.mlflow_manager.log_params(
+            {
+                "mh_horizons": ",".join(str(h) for h in horizons),
+                "mh_n_splits": n_splits,
+                "mh_aggregate_daily": aggregate_daily,
+            }
+        )
+
+        evaluator = MultiHorizonEvaluator(
+            model_config=self.model_config,
+            metrics_fn=self.calculate_metrics,
+        )
+        try:
+            horizon_results = evaluator.evaluate_horizons(
+                df=cv_data,
+                target_col=target_col,
+                date_col=date_col,
+                horizons=horizons,
+                n_splits=n_splits,
+                step=step,
+                min_train_size=min_train_size,
+                aggregate_daily=aggregate_daily,
+            )
+        except Exception as e:
+            logger.warning(f"Multi-horizon evaluation failed: {e}", exc_info=True)
+            return None
+
+        # Log accuracy + bias by horizon to MLflow
+        flat_metrics = {}
+        for model_name, payload in horizon_results.get("models", {}).items():
+            for row in payload.get("horizon_summary", []):
+                h = int(row["horizon"])
+                for metric in ("rmse", "mae", "wape", "bias", "mape"):
+                    val = row.get(metric)
+                    if val is not None and not (isinstance(val, float) and np.isnan(val)):
+                        flat_metrics[f"{model_name}_h{h}_{metric}"] = float(val)
+        if flat_metrics:
+            self.mlflow_manager.log_metrics(flat_metrics)
+
+        # Persist summary tables
+        try:
+            import os
+
+            mh_dir = "/tmp/multi_horizon_evaluation"
+            os.makedirs(mh_dir, exist_ok=True)
+            summary_df = horizon_summary_frame(horizon_results)
+            summary_path = os.path.join(mh_dir, "accuracy_bias_by_horizon.csv")
+            summary_df.to_csv(summary_path, index=False)
+            # Bias-focused table
+            bias_cols = [c for c in ["model", "horizon", "bias", "bias_std", "n_folds"] if c in summary_df.columns]
+            if bias_cols:
+                summary_df[bias_cols].to_csv(
+                    os.path.join(mh_dir, "bias_by_horizon.csv"), index=False
+                )
+            self.mlflow_manager.log_artifacts(mh_dir)
+        except Exception as art_err:
+            logger.warning(f"Could not persist multi-horizon artifacts: {art_err}")
+
+        return horizon_results
+
+    def run_forecast_quality_checks(
+        self,
+        test_df: pd.DataFrame,
+        predictions: Dict[str, np.ndarray],
+        target_col: str = "sales",
+        date_col: str = "date",
+    ) -> Optional[Dict[str, Any]]:
+        """
+        Automated forecast quality checks with PASS / WARNING / FAIL summary.
+
+        Logs metrics + JSON/CSV/TXT artifacts to MLflow. Does not alter training.
+        """
+        fq_cfg = dict(
+            (self.config.get("monitoring") or {}).get("forecast_quality", {}) or {}
+        )
+        if not fq_cfg.get("enabled", True):
+            logger.info("Forecast quality checks disabled in config")
+            return None
+
+        try:
+            from ml_models.forecast_quality import ForecastQualityThresholds
+
+            checker = ForecastQualityChecker(
+                thresholds=ForecastQualityThresholds.from_mapping(fq_cfg)
+            )
+            pred_map = {
+                name: preds
+                for name, preds in predictions.items()
+                if preds is not None
+                and name
+                not in (
+                    "rolling_origin_cv",
+                    "multi_horizon_evaluation",
+                    "forecast_quality",
+                )
+            }
+            entity_col = "store_id" if "store_id" in test_df.columns else None
+            report = checker.check_models(
+                actual_df=test_df,
+                predictions=pred_map,
+                timestamp_col=date_col,
+                actual_col=target_col,
+                entity_col=entity_col,
+            )
+
+            metrics = flatten_quality_metrics(report)
+            if metrics:
+                self.mlflow_manager.log_metrics(metrics)
+
+            paths = write_quality_artifacts(report, output_dir="/tmp/forecast_quality")
+            self.mlflow_manager.log_artifacts("/tmp/forecast_quality")
+            report["artifact_paths"] = paths
+
+            logger.info(
+                f"Forecast quality overall: {report.get('summary')} "
+                f"(artifacts: {list(paths.values())})"
+            )
+            return report
+        except Exception as e:
+            logger.warning(f"Forecast quality checks failed: {e}", exc_info=True)
+            return None
+
     def train_all_models(self, train_df: pd.DataFrame, val_df: pd.DataFrame,
                         test_df: pd.DataFrame, target_col: str = 'sales',
                         use_optuna: bool = True) -> Dict[str, Dict[str, Any]]:
@@ -382,173 +778,252 @@ class ModelTrainer:
                 'metrics': lgb_metrics,
                 'predictions': lgb_pred
             }
-            
+
+            # Validation predictions for ensemble weighting
+            xgb_val_pred = xgb_model.predict(X_val)
+            lgb_val_pred = lgb_model.predict(X_val)
+
+            ensemble_member_preds = {
+                'xgboost': {'test': xgb_pred, 'val': xgb_val_pred},
+                'lightgbm': {'test': lgb_pred, 'val': lgb_val_pred},
+            }
+
             # Train Prophet if enabled
-            prophet_enabled = self.model_config.get('prophet', {}).get('enabled', True)
-            
+            prophet_enabled = self._is_model_enabled('prophet', default=False)
+
             if prophet_enabled:
                 try:
                     prophet_model = self.train_prophet(train_df, val_df)
-                    
+
                     # Create future dataframe for Prophet predictions
                     future = test_df[['date']].rename(columns={'date': 'ds'})
-                    
+
                     # Add regressors if they exist
                     if hasattr(prophet_model, 'extra_regressors') and prophet_model.extra_regressors:
                         regressor_cols = [col for col in prophet_model.extra_regressors.keys()]
                         for col in regressor_cols:
                             if col in test_df.columns:
                                 future[col] = test_df[col]
-                    
+
                     prophet_pred = prophet_model.predict(future)['yhat'].values
                     prophet_metrics = self.calculate_metrics(y_test, prophet_pred)
-                    
+
                     self.mlflow_manager.log_metrics({f"prophet_{k}": v for k, v in prophet_metrics.items()})
-                    
+
+                    # Val predictions for weighting
+                    future_val = val_df[['date']].rename(columns={'date': 'ds'})
+                    if hasattr(prophet_model, 'extra_regressors') and prophet_model.extra_regressors:
+                        for col in prophet_model.extra_regressors.keys():
+                            if col in val_df.columns:
+                                future_val[col] = val_df[col]
+                    prophet_val_pred = prophet_model.predict(future_val)['yhat'].values
+
                     results['prophet'] = {
                         'model': prophet_model,
                         'metrics': prophet_metrics,
                         'predictions': prophet_pred
                     }
-                    
-                    # Ensemble predictions with all three models
-                    ensemble_pred = (xgb_pred + lgb_pred + prophet_pred) / 3
+                    ensemble_member_preds['prophet'] = {
+                        'test': prophet_pred,
+                        'val': prophet_val_pred,
+                    }
                 except Exception as e:
-                    logger.warning(f"Prophet training failed: {e}. Using weighted ensemble of XGBoost and LightGBM.")
+                    logger.warning(
+                        f"Prophet training failed: {e}. Continuing without Prophet."
+                    )
                     prophet_enabled = False
-            
-            if not prophet_enabled:
-                # Weighted ensemble based on individual model performance (using validation R2)
-                xgb_val_pred = xgb_model.predict(X_val)
-                lgb_val_pred = lgb_model.predict(X_val)
-                
-                xgb_val_r2 = r2_score(y_val, xgb_val_pred)
-                lgb_val_r2 = r2_score(y_val, lgb_val_pred)
-                
-                # Calculate weights based on R2 scores with minimum weight constraint
-                # This prevents a poorly performing model from being completely ignored
-                min_weight = 0.2
-                xgb_weight = max(min_weight, xgb_val_r2 / (xgb_val_r2 + lgb_val_r2))
-                lgb_weight = max(min_weight, lgb_val_r2 / (xgb_val_r2 + lgb_val_r2))
-                
-                # Normalize weights
-                total_weight = xgb_weight + lgb_weight
-                xgb_weight = xgb_weight / total_weight
-                lgb_weight = lgb_weight / total_weight
-                
-                logger.info(f"Ensemble weights - XGBoost: {xgb_weight:.3f}, LightGBM: {lgb_weight:.3f}")
-                
-                # Create ensemble model
-                ensemble_weights = {
-                    'xgboost': xgb_weight,
-                    'lightgbm': lgb_weight
+
+            # Classical time-series models (Seasonal Naive, Holt-Winters, SARIMAX)
+            classical_results = self._train_classical_ts_models(
+                train_df, val_df, test_df, y_test, target_col
+            )
+            for model_name, model_result in classical_results.items():
+                results[model_name] = {
+                    'model': model_result['model'],
+                    'metrics': model_result['metrics'],
+                    'predictions': model_result['predictions'],
                 }
-                
-                # Use simple weighted ensemble based on validation performance
-                ensemble_pred = xgb_weight * xgb_pred + lgb_weight * lgb_pred
-            
-            # Create the ensemble model object
-            ensemble_models = {
-                'xgboost': xgb_model,
-                'lightgbm': lgb_model
+                ensemble_member_preds[model_name] = {
+                    'test': model_result['predictions'],
+                    'val': model_result['val_predictions'],
+                }
+
+            # Weighted ensemble from all successfully trained members (evaluation)
+            val_scores = {
+                name: r2_score(y_val, preds['val'])
+                for name, preds in ensemble_member_preds.items()
             }
-            
-            if 'prophet' in results:
-                ensemble_models['prophet'] = results['prophet']['model']
-                ensemble_weights = {
-                    'xgboost': 1/3,
-                    'lightgbm': 1/3,
-                    'prophet': 1/3
-                }
-            
-            ensemble_model = EnsembleModel(ensemble_models, ensemble_weights)
-            
+            ensemble_weights = self._compute_ensemble_weights(val_scores)
+            logger.info(
+                "Ensemble weights: "
+                + ", ".join(f"{k}: {v:.3f}" for k, v in ensemble_weights.items())
+            )
+
+            ensemble_pred = np.zeros_like(y_test, dtype=float)
+            for name, preds in ensemble_member_preds.items():
+                ensemble_pred += ensemble_weights[name] * np.asarray(preds['test'], dtype=float)
+
+            # Deployable EnsembleModel keeps tabular models only (predict(X) API)
+            deployable_models = {
+                'xgboost': xgb_model,
+                'lightgbm': lgb_model,
+            }
+            deployable_weights = {
+                k: ensemble_weights[k]
+                for k in deployable_models
+                if k in ensemble_weights
+            }
+            # Renormalize deployable weights
+            deployable_total = sum(deployable_weights.values()) or 1.0
+            deployable_weights = {
+                k: v / deployable_total for k, v in deployable_weights.items()
+            }
+
+            ensemble_model = EnsembleModel(deployable_models, deployable_weights)
+
             # Save ensemble model
             self.models['ensemble'] = ensemble_model
-            
+
             ensemble_metrics = self.calculate_metrics(y_test, ensemble_pred)
-            
+
             self.mlflow_manager.log_metrics({f"ensemble_{k}": v for k, v in ensemble_metrics.items()})
-            self.mlflow_manager.log_model(ensemble_model, "ensemble", 
+            self.mlflow_manager.log_params(
+                {f"ensemble_weight_{k}": float(v) for k, v in ensemble_weights.items()}
+            )
+            self.mlflow_manager.log_model(ensemble_model, "ensemble",
                                          input_example=X_train.iloc[:5])
-            
+
             results['ensemble'] = {
                 'model': ensemble_model,
                 'metrics': ensemble_metrics,
-                'predictions': ensemble_pred
+                'predictions': ensemble_pred,
+                'weights': ensemble_weights,
             }
-            
+
+            # Rolling-origin CV on train+val (holdout test unchanged)
+            logger.info("Running rolling-origin time-series cross-validation...")
+            cv_results = self.run_rolling_origin_cv(
+                train_df, val_df, target_col=target_col, date_col="date"
+            )
+            if cv_results:
+                results["rolling_origin_cv"] = cv_results
+                for model_name, model_cv in cv_results.get("models", {}).items():
+                    if model_name in results:
+                        results[model_name]["cv_metrics"] = model_cv.get("aggregated", {})
+
+            # Multi-horizon evaluation (1 / 3 / 7 / 14 day)
+            logger.info("Running multi-horizon forecast evaluation...")
+            horizon_results = self.run_multi_horizon_evaluation(
+                train_df, val_df, target_col=target_col, date_col="date"
+            )
+            if horizon_results:
+                results["multi_horizon_evaluation"] = horizon_results
+                for model_name, payload in horizon_results.get("models", {}).items():
+                    if model_name in results:
+                        results[model_name]["horizon_metrics"] = payload.get(
+                            "horizon_summary", []
+                        )
+
             # Run diagnostics
             logger.info("Running model diagnostics...")
             test_predictions = {
-                'xgboost': xgb_pred if 'xgboost' in results else None,
-                'lightgbm': lgb_pred if 'lightgbm' in results else None,
-                'ensemble': ensemble_pred
+                name: result['predictions']
+                for name, result in results.items()
+                if isinstance(result, dict) and result.get('predictions') is not None
             }
-            
+
             diagnosis = diagnose_model_performance(
                 train_df, val_df, test_df, test_predictions, target_col
             )
-            
+
             logger.info("Diagnostic recommendations:")
             for rec in diagnosis['recommendations']:
                 logger.warning(f"- {rec}")
-            
+
+            # Automated forecast quality checks (PASS / WARNING / FAIL)
+            logger.info("Running automated forecast quality checks...")
+            quality_report = self.run_forecast_quality_checks(
+                test_df, test_predictions, target_col=target_col, date_col="date"
+            )
+            if quality_report:
+                results["forecast_quality"] = {
+                    "summary": quality_report.get("summary"),
+                    "n_models": quality_report.get("n_models"),
+                    "models": {
+                        name: {
+                            "summary": rep.get("summary"),
+                            "n_pass": rep.get("n_pass"),
+                            "n_warning": rep.get("n_warning"),
+                            "n_fail": rep.get("n_fail"),
+                            "checks": rep.get("checks"),
+                        }
+                        for name, rep in (quality_report.get("models") or {}).items()
+                    },
+                }
+
             # Generate visualizations
             logger.info("Generating model comparison visualizations...")
             try:
-                self._generate_and_log_visualizations(results, test_df, target_col)
+                self._generate_and_log_visualizations(
+                    results,
+                    test_df,
+                    target_col,
+                    cv_results=cv_results,
+                    horizon_results=horizon_results,
+                )
             except Exception as viz_error:
                 logger.error(f"Visualization generation failed: {viz_error}", exc_info=True)
-            
+
             # Save artifacts
             self.save_artifacts()
-            
+
             # Get current run ID for verification
             current_run_id = mlflow.active_run().info.run_id
-            
+
             self.mlflow_manager.end_run()
-            
+
             # Sync artifacts to S3
             from utils.mlflow_s3_utils import MLflowS3Manager
-            
+
             logger.info("Syncing artifacts to S3...")
             try:
                 s3_manager = MLflowS3Manager()
                 s3_manager.sync_mlflow_artifacts_to_s3(current_run_id)
                 logger.info("✓ Successfully synced artifacts to S3")
-                
+
                 # Verify S3 artifacts after sync
                 from utils.s3_verification import verify_s3_artifacts, log_s3_verification_results
-                
+
                 logger.info("Verifying S3 artifact storage...")
                 verification_results = verify_s3_artifacts(
                     run_id=current_run_id,
                     expected_artifacts=[
-                        'models/', 
-                        'scalers.pkl', 
-                        'encoders.pkl', 
+                        'models/',
+                        'scalers.pkl',
+                        'encoders.pkl',
                         'feature_cols.pkl',
                         'visualizations/',
                         'reports/'
                     ]
                 )
                 log_s3_verification_results(verification_results)
-                
+
                 if not verification_results["success"]:
                     logger.warning("S3 artifact verification failed after sync")
             except Exception as e:
                 logger.error(f"Failed to sync artifacts to S3: {e}")
-            
+
         except Exception as e:
             self.mlflow_manager.end_run(status="FAILED")
             raise e
-        
+
         return results
-    
-    def _generate_and_log_visualizations(self, results: Dict[str, Any], 
-                                       test_df: pd.DataFrame, 
-                                       target_col: str = 'sales') -> None:
+
+    def _generate_and_log_visualizations(self, results: Dict[str, Any],
+                                       test_df: pd.DataFrame,
+                                       target_col: str = 'sales',
+                                       cv_results: Optional[Dict[str, Any]] = None,
+                                       horizon_results: Optional[Dict[str, Any]] = None) -> None:
         """Generate and log model comparison visualizations to MLflow"""
         try:
             from ml_models.model_visualization import ModelVisualizer
@@ -561,40 +1036,52 @@ class ModelTrainer:
             # Extract metrics
             metrics_dict = {}
             for model_name, model_results in results.items():
-                if 'metrics' in model_results:
-                    metrics_dict[model_name] = model_results['metrics']
-            
+                if not isinstance(model_results, dict):
+                    continue
+                if model_name == "rolling_origin_cv":
+                    continue
+                if model_name == "multi_horizon_evaluation":
+                    continue
+                if model_name == "forecast_quality":
+                    continue
+                if "metrics" in model_results:
+                    metrics_dict[model_name] = model_results["metrics"]
+
             # Prepare predictions data
             predictions_dict = {}
             for model_name, model_results in results.items():
-                if 'predictions' in model_results and model_results['predictions'] is not None:
-                    pred_df = test_df[['date']].copy()
-                    pred_df['prediction'] = model_results['predictions']
+                if not isinstance(model_results, dict):
+                    continue
+                if "predictions" in model_results and model_results["predictions"] is not None:
+                    pred_df = test_df[["date"]].copy()
+                    pred_df["prediction"] = model_results["predictions"]
                     predictions_dict[model_name] = pred_df
-            
+
             # Extract feature importance if available
             feature_importance_dict = {}
             for model_name, model_results in results.items():
-                if model_name in ['xgboost', 'lightgbm'] and 'model' in model_results:
-                    model = model_results['model']
-                    if hasattr(model, 'feature_importances_'):
+                if model_name in ["xgboost", "lightgbm"] and isinstance(model_results, dict) and "model" in model_results:
+                    model = model_results["model"]
+                    if hasattr(model, "feature_importances_"):
                         importance_df = pd.DataFrame({
-                            'feature': self.feature_cols,
-                            'importance': model.feature_importances_
-                        }).sort_values('importance', ascending=False)
+                            "feature": self.feature_cols,
+                            "importance": model.feature_importances_,
+                        }).sort_values("importance", ascending=False)
                         feature_importance_dict[model_name] = importance_df
-            
+
             # Create temporary directory for visualizations
             with tempfile.TemporaryDirectory() as temp_dir:
                 logger.info(f"Creating visualizations in temporary directory: {temp_dir}")
-                
+
                 # Generate all visualizations
                 saved_files = visualizer.create_comprehensive_report(
                     metrics_dict=metrics_dict,
                     predictions_dict=predictions_dict,
                     actual_data=test_df,
                     feature_importance_dict=feature_importance_dict if feature_importance_dict else None,
-                    save_dir=temp_dir
+                    save_dir=temp_dir,
+                    cv_results=cv_results,
+                    horizon_results=horizon_results,
                 )
                 
                 logger.info(f"Generated {len(saved_files)} visualization files: {list(saved_files.keys())}")
@@ -674,21 +1161,27 @@ class ModelTrainer:
         
         # Add each visualization section
         sections = [
-            ('metrics_comparison', 'Model Performance Metrics'),
+            ('metrics_comparison', 'Model Performance Metrics (MAE / RMSE / WAPE / Bias)'),
+            ('metrics_comparison_table', 'Model Comparison Table'),
             ('predictions_comparison', 'Predictions Comparison'),
             ('residuals_analysis', 'Residuals Analysis'),
             ('error_distribution', 'Error Distribution'),
             ('feature_importance', 'Feature Importance'),
+            ('rolling_origin_cv', 'Rolling-Origin Cross-Validation'),
+            ('horizon_accuracy', 'Forecast Accuracy by Horizon'),
             ('summary', 'Summary Statistics')
         ]
         
         for key, title in sections:
             if key in saved_files:
+                file_path = saved_files[key]
+                if not str(file_path).lower().endswith(('.png', '.jpg', '.jpeg')):
+                    continue
                 html_content += f'<div class="section"><h2>{title}</h2>'
                 
-                # All files are now PNG - base64 encode them
+                # All image files are PNG - base64 encode them
                 import base64
-                with open(saved_files[key], 'rb') as f:
+                with open(file_path, 'rb') as f:
                     img_data = base64.b64encode(f.read()).decode()
                 html_content += f'<img src="data:image/png;base64,{img_data}" alt="{title}">'
                 
@@ -708,22 +1201,28 @@ class ModelTrainer:
         joblib.dump(self.scalers, '/tmp/scalers.pkl')
         joblib.dump(self.encoders, '/tmp/encoders.pkl')
         joblib.dump(self.feature_cols, '/tmp/feature_cols.pkl')
-        
+
         # Save individual models in the expected format
         import os
         os.makedirs('/tmp/models/xgboost', exist_ok=True)
         os.makedirs('/tmp/models/lightgbm', exist_ok=True)
         os.makedirs('/tmp/models/ensemble', exist_ok=True)
-        
+
         if 'xgboost' in self.models:
             joblib.dump(self.models['xgboost'], '/tmp/models/xgboost/xgboost_model.pkl')
-        
+
         if 'lightgbm' in self.models:
             joblib.dump(self.models['lightgbm'], '/tmp/models/lightgbm/lightgbm_model.pkl')
-            
+
         if 'ensemble' in self.models:
             joblib.dump(self.models['ensemble'], '/tmp/models/ensemble/ensemble_model.pkl')
-        
+
+        for model_name in CLASSICAL_TS_MODELS:
+            if model_name in self.models:
+                model_dir = f'/tmp/models/{model_name}'
+                os.makedirs(model_dir, exist_ok=True)
+                joblib.dump(self.models[model_name], f'{model_dir}/{model_name}_model.pkl')
+
         self.mlflow_manager.log_artifacts('/tmp/')
-        
+
         logger.info("Artifacts saved successfully")
